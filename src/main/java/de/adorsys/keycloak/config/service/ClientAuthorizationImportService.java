@@ -24,6 +24,7 @@ import de.adorsys.keycloak.config.exception.ImportProcessingException;
 import de.adorsys.keycloak.config.exception.KeycloakRepositoryException;
 import de.adorsys.keycloak.config.model.RealmImport;
 import de.adorsys.keycloak.config.properties.ImportConfigProperties;
+import de.adorsys.keycloak.config.provider.KeycloakProvider;
 import de.adorsys.keycloak.config.repository.ClientRepository;
 import de.adorsys.keycloak.config.repository.GroupRepository;
 import de.adorsys.keycloak.config.repository.IdentityProviderRepository;
@@ -45,7 +46,6 @@ import org.keycloak.representations.idm.authorization.ResourceServerRepresentati
 import org.keycloak.representations.idm.authorization.ScopeRepresentation;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Service;
 
@@ -61,7 +61,6 @@ import jakarta.ws.rs.ServerErrorException;
 import jakarta.ws.rs.WebApplicationException;
 
 import static de.adorsys.keycloak.config.properties.ImportConfigProperties.ImportManagedProperties.ImportManagedPropertiesValues.FULL;
-import static java.lang.Boolean.TRUE;
 
 @Service
 @SuppressWarnings({"java:S1192"})
@@ -73,14 +72,38 @@ public class ClientAuthorizationImportService {
     public static final String ADMIN_PERMISSIONS_CLIENT_ID = "admin-permissions";
     private static final int HTTP_NOT_FOUND = 404;
     private static final int HTTP_NOT_IMPLEMENTED = 501;
-    private static final String FGAP_V2_WARNING = "Authorization API not supported (likely FGAP V2 active). "
-            + "Authorization will be handled at realm level.";
-    private static final String FGAP_V2_RESOURCE_WARNING = "Cannot {} authorization resource '{}' for client '{}' - "
-            + FGAP_V2_WARNING;
-    private static final String FGAP_V2_SCOPE_WARNING = "Cannot {} authorization scope '{}' for client '{}' - "
-            + FGAP_V2_WARNING;
-    private static final String FGAP_V2_POLICY_WARNING = "Cannot {} authorization policy '{}' for client '{}' - "
-            + FGAP_V2_WARNING;
+    private static final String FGAP_V2_RESOURCE_WARNING = "Cannot {} authorization resource '{}' for client '{}' - {}";
+    private static final String FGAP_V2_SCOPE_WARNING = "Cannot {} authorization scope '{}' for client '{}' - {}";
+    private static final String FGAP_V2_POLICY_WARNING = "Cannot {} authorization policy '{}' for client '{}' - {}";
+
+    /**
+     * Maps FGAP V2 resource types to V1 permission types.
+     * V2 uses plural forms (Clients, Groups), V1 uses singular (client, group).
+     */
+    private enum ResourceTypeMapping {
+        CLIENTS("Clients", "client"),
+        GROUPS("Groups", "group"),
+        USERS("Users", "user"),
+        ROLES("Roles", "role"),
+        IDENTITY_PROVIDERS("IdentityProviders", "idp");
+
+        private final String v2ResourceType;
+        private final String v1PermissionType;
+
+        ResourceTypeMapping(String v2ResourceType, String v1PermissionType) {
+            this.v2ResourceType = v2ResourceType;
+            this.v1PermissionType = v1PermissionType;
+        }
+
+        static String getV1PermissionType(String v2ResourceType) {
+            for (ResourceTypeMapping mapping : values()) {
+                if (mapping.v2ResourceType.equals(v2ResourceType)) {
+                    return mapping.v1PermissionType;
+                }
+            }
+            return null;
+        }
+    }
 
     private final ClientRepository clientRepository;
     private final IdentityProviderRepository identityProviderRepository;
@@ -88,15 +111,16 @@ public class ClientAuthorizationImportService {
     private final GroupRepository groupRepository;
     private final ImportConfigProperties importConfigProperties;
     private final StateService stateService;
+    private final KeycloakProvider keycloakProvider;
 
-    @Autowired
     public ClientAuthorizationImportService(
             ClientRepository clientRepository,
             IdentityProviderRepository identityProviderRepository,
             RoleRepository roleRepository,
             GroupRepository groupRepository,
             ImportConfigProperties importConfigProperties,
-            StateService stateService
+            StateService stateService,
+            KeycloakProvider keycloakProvider
     ) {
         this.clientRepository = clientRepository;
         this.identityProviderRepository = identityProviderRepository;
@@ -104,6 +128,18 @@ public class ClientAuthorizationImportService {
         this.groupRepository = groupRepository;
         this.importConfigProperties = importConfigProperties;
         this.stateService = stateService;
+        this.keycloakProvider = keycloakProvider;
+    }
+
+    private String getFgapV2Message() {
+        try {
+            if (keycloakProvider != null && keycloakProvider.isFgapV2Active()) {
+                return "FGAP V2 is active (authorization managed at realm level).";
+            }
+        } catch (Exception e) {
+            logger.debug("Unable to determine FGAP V2 status, using fallback message", e);
+        }
+        return "Authorization API not supported.";
     }
 
     public void doImport(RealmImport realmImport) {
@@ -115,6 +151,19 @@ public class ClientAuthorizationImportService {
         updateClientAuthorizationSettings(realmImport, clients);
     }
 
+    /**
+     * Updates client authorization settings.
+     *
+     * <p>In FGAP V2 (Keycloak 26.2+), the 'admin-permissions' client is system-managed.
+     * Keycloak blocks API access to its authorization settings, making existing state retrieval impossible.
+     * Attempting to recreate existing policies would cause conflicts.
+     *
+     * <p>When FGAP V2 is detected, authorization processing is skipped for 'admin-permissions'.
+     * Remove this client from import configurations and use the realm-level
+     * {@code adminPermissionsEnabled} flag instead.
+     *
+     * @see <a href="https://github.com/keycloak/keycloak/issues/43977">Keycloak Issue #43977</a>
+     */
     private void updateClientAuthorizationSettings(
             RealmImport realmImport,
             List<ClientRepresentation> clients
@@ -125,7 +174,21 @@ public class ClientAuthorizationImportService {
                 .filter(client -> client.getAuthorizationSettings() != null)
                 .toList();
 
+        boolean fgapV2Active = false;
+        try {
+            fgapV2Active = keycloakProvider.isFgapV2Active();
+        } catch (Exception e) {
+            logger.debug("Unable to determine FGAP V2 status in updateClientAuthorizationSettings: {}", e.getMessage());
+        }
+
         for (ClientRepresentation client : clientsWithAuthorization) {
+            if (fgapV2Active && ADMIN_PERMISSIONS_CLIENT_ID.equals(client.getClientId())) {
+                logger.info("Skipping authorization settings for 'admin-permissions' client in realm '{}' - "
+                        + "FGAP V2 manages this client internally and blocks API access (see https://github.com/keycloak/keycloak/issues/43977). "
+                        + "Remove this client from your import configuration and use realm-level adminPermissionsEnabled flag instead.", realmName);
+                continue;
+            }
+
             ClientRepresentation existingClient = getExistingClient(realmName, client);
             updateAuthorization(realmName, existingClient, client.getAuthorizationSettings());
         }
@@ -140,14 +203,24 @@ public class ClientAuthorizationImportService {
         // Cannot detect authorizationSchema (only in KC client lib 26.2+) - rely on runtime errors
 
         if (importConfigProperties.isValidate() && !REALM_MANAGEMENT_CLIENT_ID.equals(client.getClientId())
-                && (TRUE.equals(client.isBearerOnly()) || TRUE.equals(client.isPublicClient()))) {
+                && (Boolean.TRUE.equals(client.isBearerOnly()) || Boolean.TRUE.equals(client.isPublicClient()))) {
             throw new ImportProcessingException(
                     "Unsupported authorization settings for client '%s' in realm '%s': client must be confidential.",
                     getClientIdentifier(client), realmName
             );
         }
 
-        RealmManagementPermissionsResolver realmManagementPermissionsResolver = new RealmManagementPermissionsResolver(realmName);
+        // Detect FGAP V2 with error handling fallback
+        boolean fgapV2;
+        try {
+            fgapV2 = keycloakProvider.isFgapV2Active();
+        } catch (Exception e) {
+            logger.warn("Unable to detect FGAP V2 status for realm '{}', falling back to V1 behavior: {}",
+                    realmName, e.getMessage());
+            fgapV2 = false;
+        }
+
+        RealmManagementPermissionsResolver realmManagementPermissionsResolver = new RealmManagementPermissionsResolver(realmName, fgapV2);
         if (REALM_MANAGEMENT_CLIENT_ID.equals(client.getClientId())) {
             realmManagementPermissionsResolver.createFineGrantedPermissions(authorizationSettingsToImport);
         }
@@ -184,10 +257,9 @@ public class ClientAuthorizationImportService {
         } catch (NotFoundException | BadRequestException | ServerErrorException e) {
             int statusCode = e.getResponse().getStatus();
             if (statusCode == HTTP_NOT_FOUND || statusCode == HTTP_NOT_IMPLEMENTED || statusCode == 400) {
-                logger.debug("Cannot refresh authorization config for client '{}' in realm '{}' (HTTP {}) - "
-                        + "Authorization API not supported (likely FGAP V2 active). "
+                logger.debug("Cannot refresh authorization config for client '{}' in realm '{}' (HTTP {}) - {} "
                         + "Using existing authorization settings.",
-                        getClientIdentifier(client), realmName, statusCode);
+                        getClientIdentifier(client), realmName, statusCode, getFgapV2Message());
                 // Use the existing authorization settings we already have
             } else {
                 throw e;
@@ -223,8 +295,13 @@ public class ClientAuthorizationImportService {
                                                              RealmManagementPermissionsResolver realmManagementPermissionsResolver) {
         policy.setName(realmManagementPermissionsResolver.getSanitizedAuthzPolicyName(policy.getName()));
 
-        if (policy.getConfig().containsKey("resources") && policy.getConfig().get("resources").contains(".$")) {
-            String resources = sanitizeAuthorizationPolicyResource(policy.getConfig().get("resources"), realmManagementPermissionsResolver);
+        if (policy.getConfig().containsKey("resources") && policy.getConfig().get("resources").contains("$")) {
+            String defaultResourceType = policy.getConfig().get("defaultResourceType");
+            String resources = sanitizeAuthorizationPolicyResource(
+                    policy.getConfig().get("resources"),
+                    defaultResourceType,
+                    realmManagementPermissionsResolver
+            );
             policy.getConfig().put("resources", resources);
         }
 
@@ -232,14 +309,45 @@ public class ClientAuthorizationImportService {
     }
 
     private String sanitizeAuthorizationPolicyResource(String resources,
+                                                       String defaultResourceType,
                                                        RealmManagementPermissionsResolver realmManagementPermissionsResolver) {
         List<String> resourcesList = JsonUtil.fromJson(resources);
         resourcesList = resourcesList.stream()
-                .map(realmManagementPermissionsResolver::getSanitizedAuthzResourceName)
+                .map(resource -> sanitizeSinglePolicyResource(resource, defaultResourceType, realmManagementPermissionsResolver))
                 .toList();
 
-        resources = JsonUtil.toJson(resourcesList);
-        return resources;
+        return JsonUtil.toJson(resourcesList);
+    }
+
+    private String sanitizeSinglePolicyResource(String resource,
+                                               String defaultResourceType,
+                                               RealmManagementPermissionsResolver realmManagementPermissionsResolver) {
+        if (resource.contains(".resource.")) {
+            return realmManagementPermissionsResolver.getSanitizedAuthzResourceName(resource);
+        }
+
+        if (resource.startsWith("$")) {
+            if (defaultResourceType == null || defaultResourceType.isEmpty()) {
+                logger.warn("Found bare placeholder '{}' but no defaultResourceType specified in policy config, skipping transformation", resource);
+                return resource;
+            }
+
+            String permissionType = mapResourceTypeToPermissionType(defaultResourceType);
+            if (permissionType == null) {
+                logger.warn("Unknown defaultResourceType '{}' for bare placeholder '{}', skipping transformation", defaultResourceType, resource);
+                return resource;
+            }
+
+            String fullResourceName = permissionType + ".resource." + resource;
+            return realmManagementPermissionsResolver.getSanitizedAuthzResourceName(fullResourceName);
+        }
+
+        // No placeholder to resolve
+        return resource;
+    }
+
+    private String mapResourceTypeToPermissionType(String resourceType) {
+        return ResourceTypeMapping.getV1PermissionType(resourceType);
     }
 
     private void handleAuthorizationSettings(
@@ -327,16 +435,15 @@ public class ClientAuthorizationImportService {
         try {
             clientRepository.createAuthorizationResource(realmName, client.getId(), authorizationResourceToImport);
         } catch (KeycloakRepositoryException e) {
-            if (e.getMessage().contains("Authorization API not supported")
-                    && e.getMessage().contains("likely FGAP V2 active")) {
+            if (e.getMessage().contains("Authorization API not supported")) {
                 // V2 resource type definitions (Groups, Users, Clients, Roles) are auto-created by Keycloak
                 boolean isV2ResourceType = authorizationResourceToImport.getName().matches("^(Groups|Users|Clients|Roles)$");
                 if (ADMIN_PERMISSIONS_CLIENT_ID.equals(client.getClientId()) && isV2ResourceType) {
                     logger.debug("Skipping V2 resource type '{}' - auto-managed by Keycloak",
                             authorizationResourceToImport.getName());
                 } else {
-                    logger.warn(FGAP_V2_RESOURCE_WARNING,
-                            "create", authorizationResourceToImport.getName(), getClientIdentifier(client));
+                    logger.warn("Cannot create authorization resource '{}' for client '{}' - {}",
+                            authorizationResourceToImport.getName(), getClientIdentifier(client), getFgapV2Message());
                 }
                 return;
             }
@@ -348,17 +455,16 @@ public class ClientAuthorizationImportService {
                     logger.debug("Skipping V2 resource type '{}' - auto-managed by Keycloak",
                             authorizationResourceToImport.getName());
                 } else {
-                    logger.warn("Cannot create authorization resource '{}' for client '{}' - "
-                            + "Client does not support FGAP V1 authorization (likely FGAP V2 active). " + FGAP_V2_WARNING,
-                            authorizationResourceToImport.getName(), getClientIdentifier(client));
+                    logger.warn("Cannot create authorization resource '{}' for client '{}' - Client does not support FGAP V1 authorization. {}",
+                            authorizationResourceToImport.getName(), getClientIdentifier(client), getFgapV2Message());
                 }
                 return;
             }
             throw e;
         } catch (WebApplicationException e) {
             if (e.getResponse().getStatus() == HTTP_NOT_FOUND) {
-                logger.warn("Cannot create authorization resource '{}' for client '{}' - " + FGAP_V2_WARNING,
-                        authorizationResourceToImport.getName(), getClientIdentifier(client));
+                logger.warn("Cannot create authorization resource '{}' for client '{}' - {}",
+                        authorizationResourceToImport.getName(), getClientIdentifier(client), getFgapV2Message());
                 return;
             }
             throw e;
@@ -404,7 +510,7 @@ public class ClientAuthorizationImportService {
         } catch (NotFoundException | ServerErrorException e) {
             if (isFgapV2Error(e.getResponse().getStatus())) {
                 logger.warn(FGAP_V2_RESOURCE_WARNING,
-                        "update", authorizationResourceToImport.getName(), getClientIdentifier(client));
+                        "update", authorizationResourceToImport.getName(), getClientIdentifier(client), getFgapV2Message());
                 return;
             }
             throw e;
@@ -443,7 +549,7 @@ public class ClientAuthorizationImportService {
         } catch (NotFoundException | ServerErrorException e) {
             if (isFgapV2Error(e.getResponse().getStatus())) {
                 logger.warn(FGAP_V2_RESOURCE_WARNING,
-                        "remove", existingClientAuthorizationResource.getName(), getClientIdentifier(client));
+                        "remove", existingClientAuthorizationResource.getName(), getClientIdentifier(client), getFgapV2Message());
                 return;
             }
             throw e;
@@ -482,17 +588,16 @@ public class ClientAuthorizationImportService {
                         realmName, client.getId(), authorizationScopeToImport
                 );
             } catch (KeycloakRepositoryException e) {
-                if (e.getMessage().contains("Authorization API not supported")
-                        && e.getMessage().contains("likely FGAP V2 active")) {
+                if (e.getMessage().contains("Authorization API not supported")) {
                     logger.warn(FGAP_V2_SCOPE_WARNING,
-                            "add", authorizationScopeToImport.getName(), getClientIdentifier(client));
+                            "add", authorizationScopeToImport.getName(), getClientIdentifier(client), getFgapV2Message());
                     return; // Continue gracefully
                 }
                 throw e;
             } catch (NotFoundException | ServerErrorException e) {
                 if (isFgapV2Error(e.getResponse().getStatus())) {
                     logger.warn(FGAP_V2_SCOPE_WARNING,
-                            "add", authorizationScopeToImport.getName(), getClientIdentifier(client));
+                            "add", authorizationScopeToImport.getName(), getClientIdentifier(client), getFgapV2Message());
                     return;
                 }
                 throw e;
@@ -524,7 +629,7 @@ public class ClientAuthorizationImportService {
             } catch (NotFoundException | ServerErrorException e) {
                 if (isFgapV2Error(e.getResponse().getStatus())) {
                     logger.warn(FGAP_V2_SCOPE_WARNING,
-                            "update", authorizationScopeToImport.getName(), getClientIdentifier(client));
+                            "update", authorizationScopeToImport.getName(), getClientIdentifier(client), getFgapV2Message());
                     return;
                 }
                 throw e;
@@ -562,7 +667,7 @@ public class ClientAuthorizationImportService {
         } catch (NotFoundException | ServerErrorException e) {
             if (isFgapV2Error(e.getResponse().getStatus())) {
                 logger.warn(FGAP_V2_SCOPE_WARNING,
-                        "remove", existingClientAuthorizationScope.getName(), getClientIdentifier(client));
+                        "remove", existingClientAuthorizationScope.getName(), getClientIdentifier(client), getFgapV2Message());
                 return;
             }
             throw e;
@@ -601,17 +706,16 @@ public class ClientAuthorizationImportService {
                         realmName, client.getId(), authorizationPolicyToImport
                 );
             } catch (KeycloakRepositoryException e) {
-                if (e.getMessage().contains("Authorization API not supported")
-                        && e.getMessage().contains("likely FGAP V2 active")) {
+                if (e.getMessage().contains("Authorization API not supported")) {
                     logger.warn(FGAP_V2_POLICY_WARNING,
-                            "create", authorizationPolicyToImport.getName(), getClientIdentifier(client));
+                            "create", authorizationPolicyToImport.getName(), getClientIdentifier(client), getFgapV2Message());
                     return; // Continue gracefully
                 }
                 throw e;
             } catch (NotFoundException | ServerErrorException e) {
                 if (isFgapV2Error(e.getResponse().getStatus())) {
-                    logger.warn(FGAP_V2_POLICY_WARNING,
-                            "create", authorizationPolicyToImport.getName(), getClientIdentifier(client));
+                    logger.warn(FGAP_V2_SCOPE_WARNING,
+                            "create", authorizationPolicyToImport.getName(), getClientIdentifier(client), getFgapV2Message());
                     return;
                 }
                 throw e;
@@ -645,7 +749,7 @@ public class ClientAuthorizationImportService {
             } catch (NotFoundException | ServerErrorException e) {
                 if (isFgapV2Error(e.getResponse().getStatus())) {
                     logger.warn(FGAP_V2_POLICY_WARNING,
-                            "update", authorizationPolicyToImport.getName(), getClientIdentifier(client));
+                            "update", authorizationPolicyToImport.getName(), getClientIdentifier(client), getFgapV2Message());
                     return;
                 }
                 throw e;
@@ -689,7 +793,7 @@ public class ClientAuthorizationImportService {
         } catch (ServerErrorException e) {
             if (isFgapV2Error(e.getResponse().getStatus())) {
                 logger.warn(FGAP_V2_POLICY_WARNING,
-                        "remove", existingClientAuthorizationPolicy.getName(), getClientIdentifier(client));
+                        "remove", existingClientAuthorizationPolicy.getName(), getClientIdentifier(client), getFgapV2Message());
                 return;
             }
             throw e;
@@ -761,8 +865,10 @@ public class ClientAuthorizationImportService {
 
         private final String realmName;
         private final Map<String, PermissionResolver> resolvers;
+        private final boolean isFgapV2;
 
-        public RealmManagementPermissionsResolver(String realmName) {
+        public RealmManagementPermissionsResolver(String realmName, boolean isFgapV2) {
+            this.isFgapV2 = isFgapV2;
             this.realmName = realmName;
             this.resolvers = new HashMap<>();
 
@@ -825,21 +931,30 @@ public class ClientAuthorizationImportService {
 
         private String getSanitizedAuthzPolicyName(String authzName) {
             PermissionTypeAndId typeAndId = PermissionTypeAndId.fromPolicyName(authzName);
-            return getSanitizedAuthzName(authzName, typeAndId);
+            if (typeAndId == null || !typeAndId.isPlaceholder()) {
+                return authzName;
+            }
+            String id = resolveObjectId(typeAndId, authzName);
+            return authzName.replace(typeAndId.idOrPlaceholder, id);
         }
 
         private String getSanitizedAuthzResourceName(String authzName) {
             PermissionTypeAndId typeAndId = PermissionTypeAndId.fromResourceName(authzName);
-            return getSanitizedAuthzName(authzName, typeAndId);
+            return getSanitizedAuthzName(authzName, typeAndId, true);
         }
 
 
-        private String getSanitizedAuthzName(String authzName, PermissionTypeAndId typeAndId) {
+        private String getSanitizedAuthzName(String authzName, PermissionTypeAndId typeAndId, boolean isResourceName) {
             if (typeAndId == null || !typeAndId.isPlaceholder()) {
                 return authzName;
             }
 
             String id = resolveObjectId(typeAndId, authzName);
+
+            if (isFgapV2 && isResourceName) {
+                return id;
+            }
+
             return authzName.replace(typeAndId.idOrPlaceholder, id);
         }
     }

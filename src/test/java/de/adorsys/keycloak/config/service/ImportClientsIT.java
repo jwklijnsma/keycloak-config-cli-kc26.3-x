@@ -78,6 +78,7 @@ import static org.hamcrest.core.Is.is;
 import static org.hamcrest.core.IsNull.nullValue;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assumptions.assumeFalse;
 
 @SuppressWarnings({"java:S5961", "java:S5976"})
 class ImportClientsIT extends AbstractImportIT {
@@ -2550,6 +2551,9 @@ class ImportClientsIT extends AbstractImportIT {
     @Test
     @Order(91)
     @DisabledIfSystemProperty(named = "keycloak.version", matches = "17.0.0", disabledReason = "https://github.com/keycloak/keycloak/issues/10176")
+    // NOTE: This test expects Keycloak/DB to fail on 256-character description (VARCHAR(255) constraint).
+    // Monitor CI runs: if this test starts passing unexpectedly, add @DisabledIfEnvironmentVariable
+    // or adjust test setup to enforce strict VARCHAR(255) constraints.
     void shouldNotUpdateRealmUpdateClientWithError() throws IOException {
         doImport("91.0_update_realm__try-to-update-client.json");
         RealmImport foundImport = getFirstImport("91.1_update_realm__try-to-update-client.json");
